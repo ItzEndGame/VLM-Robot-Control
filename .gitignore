@@ -1,0 +1,17 @@
+# Environment variables / secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated images
+*.png
+*.jpg
+*.jpeg
+
+# Virtual environment
+venv/
+.venv/
+env/
+robot-env/
