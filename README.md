@@ -2,7 +2,7 @@
 
 A PyBullet simulation of a two-wheeled humanoid mobile manipulator (twin-wheel base, rising neck column, torso, head-mounted camera, and a functional Franka Panda arm) that uses a Gemini vision-language model as its perception/decision layer to find and pick up a specified object on a table.
 
-Built for a robotics/AI course assignment: the robot's face camera captures a frame, Gemini decides the next discrete action (turn/move/target reached) in a closed-loop visual search, and once the target is close enough the arm executes a physics-grounded pick (and optional place into a colored box).
+The robot's face camera captures a frame, Gemini decides the next discrete action (turn/move/target reached) in a closed-loop visual search, and once the target is close enough the arm executes a physics-grounded pick (and optional place into a colored box).
 
 ## How it works
 
