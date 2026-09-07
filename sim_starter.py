@@ -66,6 +66,7 @@ Design notes (scoping decisions, worth mentioning in your report):
 import argparse
 import os
 import random
+import re
 import time
 import numpy as np
 import pybullet as p
@@ -1663,6 +1664,48 @@ def _idle_until_closed():
         pass
 
 
+# Full vocabulary of ball colors setup_static_scene knows how to spawn —
+# NOT the same as `ball_names`/objects["ball_names"], which is only the
+# subset actually present in a given run (depends on --num-balls). Kept
+# in sync with the ball_colors list built in setup_static_scene.
+_BALL_COLOR_NAMES = ["red", "green", "blue", "yellow", "purple"]
+
+# Kept in sync with the color set built in setup_static_scene.
+_BOX_COLOR_NAMES = ["orange", "cyan", "magenta", "white", "black"]
+
+# Every color word worth recognizing, ball or box — used so a request for
+# a color that's valid for the OTHER object type (e.g. "the orange ball",
+# orange is a box-only color; or "the red box", red is a ball-only color)
+# is still detected as "a color was named", not silently treated the same
+# as "no color mentioned at all". Defined once, up front, so both
+# infer_ball_target and infer_box_color scan the same full vocabulary.
+_ALL_COLOR_NAMES = _BALL_COLOR_NAMES + _BOX_COLOR_NAMES
+
+
+def _color_immediately_before(text, noun, vocabulary):
+    """
+    Find a color word that sits immediately before `noun` in `text`
+    (optionally with "colored"/"coloured" in between) — e.g. "the red
+    ball" or "the cyan colored box" -> "red" / "cyan".
+
+    This ties each matched color to the specific object it actually
+    describes, instead of just checking "does this color word appear
+    ANYWHERE in the instruction". That distinction matters as soon as an
+    instruction names two different colors for two different things —
+    e.g. "pick up the red ball and put it in the orange box": a plain
+    substring scan over a combined color vocabulary would hit "red" for
+    the BOX lookup too (since "red" appears earlier in the string), even
+    though the box is unambiguously "orange". Anchoring on adjacency to
+    the right noun avoids that cross-contamination.
+
+    Returns the matched color, or None if no color word sits directly
+    before `noun` anywhere in the text.
+    """
+    pattern = r"\b(" + "|".join(vocabulary) + r")\b\s+(?:colou?red\s+)?" + re.escape(noun) + r"\b"
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
+
+
 def infer_ball_target(instruction, ball_names):
     """
     Deterministic parse of which SPECIFIC ball the instruction names
@@ -1678,16 +1721,30 @@ def infer_ball_target(instruction, ball_names):
     fix is for the caller to narrow known_objects down to just this one
     specific target when it can be determined, so nothing else can match.
 
-    Returns a name from `ball_names`, or None if no color in the
-    instruction matches any ball actually present (caller should fall
-    back to the full list, degraded but still functional).
+    Scans the FULL `_ALL_COLOR_NAMES` vocabulary (ball AND box colors),
+    anchored to the word "ball" (see _color_immediately_before), so a
+    request for a color that simply isn't a ball in this scene — either
+    because it's a box-only color (e.g. "the orange ball") or because
+    fewer than all 5 ball colors were spawned this run (--num-balls) —
+    is still recognized as "a color was named" instead of being silently
+    treated the same as "no color was named at all". See main()'s
+    handling of the second return value for why that distinction matters.
+
+    Returns a tuple (matched_name, requested_color):
+      - matched_name: a name from `ball_names` if the requested color IS
+        one of the balls actually present this run, else None.
+      - requested_color: the raw color word found immediately before
+        "ball" in the instruction, or None if none was found. When
+        matched_name is None but requested_color isn't, the caller knows
+        a real color was named but doesn't exist in this scene —
+        different from a genuinely ambiguous instruction.
     """
     text = instruction.lower()
-    for name in ball_names:
-        color = name.split("_")[0]
-        if color in text:
-            return name
-    return None
+    color = _color_immediately_before(text, "ball", _ALL_COLOR_NAMES)
+    if color is None:
+        return None, None
+    matched = f"{color}_ball"
+    return (matched if matched in ball_names else None), color
 
 
 def infer_place_intent(instruction):
@@ -1715,10 +1772,6 @@ def infer_place_intent(instruction):
     return "none"
 
 
-# Kept in sync with the color set built in setup_static_scene.
-_BOX_COLOR_NAMES = ["orange", "cyan", "magenta", "white", "black"]
-
-
 def infer_box_color(instruction):
     """
     Deterministic parse of which box COLOR the instruction names (e.g.
@@ -1729,14 +1782,22 @@ def infer_box_color(instruction):
     discovered purely by the robot reading the box's color with its
     camera, same as it locates a ball by color.
 
-    Returns a color name string, or None if no box color was named
-    (caller should fall back to searching for any box).
+    Scans the FULL `_ALL_COLOR_NAMES` vocabulary, anchored to the word
+    "box" (see _color_immediately_before) — both so a color that's only
+    valid for a BALL (e.g. "the red box") is still recognized as "a
+    color was named", and so that anchoring to "box" specifically avoids
+    picking up a ball's color from earlier in the same instruction (e.g.
+    "pick up the red ball and put it in the orange box" must return
+    "orange", not "red"). The caller is responsible for checking the
+    returned color against `objects["box_colors"]` to know whether it's
+    actually present.
+
+    Returns a color name string, or None if no color word was named
+    immediately before "box" (caller should fall back to searching for
+    any box).
     """
     text = instruction.lower()
-    for color in _BOX_COLOR_NAMES:
-        if color in text:
-            return color
-    return None
+    return _color_immediately_before(text, "box", _ALL_COLOR_NAMES)
 
 
 def main():
@@ -1879,13 +1940,44 @@ def main():
     # infer_ball_target's docstring for why this matters: passing the
     # full list here would let the search lock onto ANY ball Gemini
     # happens to spot first, not necessarily the one asked for.
-    requested_ball = infer_ball_target(args.instruction, objects["ball_names"])
-    known_objects = [requested_ball] if requested_ball is not None else objects["ball_names"]
-    if requested_ball is None:
+    requested_ball, requested_ball_color = infer_ball_target(args.instruction, objects["ball_names"])
+    # Three distinct cases, not two:
+    #  1. requested_ball is not None       -> named color IS in the scene; search for exactly it.
+    #  2. requested_ball_color is not None
+    #     but requested_ball is None       -> a real color was named, but no ball of that color
+    #                                          exists in this scene. Do NOT fall back to "any
+    #                                          ball" here — that would silently hand back the
+    #                                          wrong object and report it as a completed pick.
+    #  3. both are None                    -> instruction didn't name a recognizable color at
+    #                                          all; genuinely ambiguous, fall back to any ball.
+    ball_color_not_in_scene = requested_ball_color is not None and requested_ball is None
+    if requested_ball is not None:
+        known_objects = [requested_ball]
+    elif ball_color_not_in_scene:
+        # Target a name that can never match a real spawned ball, so the
+        # search loop still does an honest full visual sweep (turning to
+        # scan, same as any other search) before reporting failure —
+        # rather than silently substituting a different-colored ball.
+        known_objects = [f"{requested_ball_color}_ball"]
+        print(f"\n'{requested_ball_color}' was requested, but no {requested_ball_color} ball "
+              f"exists in this scene (only {objects['ball_names']}). Doing a full visual sweep "
+              f"to confirm, then stopping instead of grabbing the wrong ball.")
+    else:
+        known_objects = objects["ball_names"]
         print(f"Could not determine which specific ball '{args.instruction!r}' refers to from its "
               f"color — searching for any of {objects['ball_names']} instead.")
 
     if args.no_perception:
+        if ball_color_not_in_scene:
+            # No search loop runs on this path at all, so there's no
+            # camera sweep to attempt — the color's absence is already
+            # certain from the scene setup, so report it immediately
+            # instead of grabbing whatever known_objects[0] resolves to
+            # (which wouldn't even be a real object here).
+            print(f"\nNo {requested_ball_color} ball found — no ball of that color exists in "
+                  f"this scene (only {objects['ball_names']}). No pick attempted.")
+            _idle_until_closed()
+            return
         # Offline fallback path: skip the search loop entirely, drive to a
         # fixed standoff point and just target the first ball.
         print("--no-perception set: skipping the visual search loop.")
@@ -1915,11 +2007,15 @@ def main():
             # object was picked unless you read the console closely. If the
             # search couldn't confirm the actual target, the honest outcome
             # is: report that clearly and stop, don't attempt a pick at all.
-            print(f"\nSearch FAILED: could not locate a target matching {args.instruction!r} "
-                  f"within {args.max_search_steps} steps.")
-            print("No pick attempted. If the robot started far from the table, try increasing "
-                  "--max-search-steps, or check that the instruction names a known object "
-                  f"({known_objects}).")
+            if ball_color_not_in_scene:
+                print(f"\nNo {requested_ball_color} ball found. A full visual sweep confirmed no "
+                      f"ball of that color exists in this scene (only {objects['ball_names']}).")
+            else:
+                print(f"\nSearch FAILED: could not locate a target matching {args.instruction!r} "
+                      f"within {args.max_search_steps} steps.")
+                print("No pick attempted. If the robot started far from the table, try increasing "
+                      "--max-search-steps, or check that the instruction names a known object "
+                      f"({known_objects}).")
             _idle_until_closed()
             return
 
@@ -1967,14 +2063,25 @@ def main():
             # one actually requested. This is likely exactly what caused
             # a real observed failure: the robot located some other box
             # while scanning past it, and placed there instead.
-            if box_color is not None and box_color in objects["box_colors"]:
+            # Same three-way split as the ball case above: a color that IS
+            # a box in this scene, a real color that ISN'T one of this
+            # scene's boxes (do an honest sweep, then fail clearly — don't
+            # silently place in a different box than the one asked for),
+            # or no color named at all (genuinely ambiguous, search any).
+            box_color_not_in_scene = box_color is not None and box_color not in objects["box_colors"]
+            if box_color is not None and not box_color_not_in_scene:
                 box_labels = [f"box_{box_color}"]
                 box_instruction = f"find the {box_color} colored box"
+            elif box_color_not_in_scene:
+                # Target a label that can never match a real spawned box,
+                # so the search loop still does a full honest sweep before
+                # reporting failure, instead of placing in the wrong box.
+                box_labels = [f"box_{box_color}"]
+                box_instruction = f"find the {box_color} colored box"
+                print(f"\n'{box_color}' was requested, but no {box_color} box exists in this "
+                      f"scene (only {sorted(objects['box_colors'])}). Doing a full visual sweep "
+                      f"to confirm, then stopping instead of placing in the wrong box.")
             else:
-                if box_color is not None:
-                    print(f"\nThe '{box_color}' box was requested but only "
-                          f"{sorted(objects['box_colors'])} boxes exist in this scene — "
-                          f"searching for any box instead.")
                 box_labels = [f"box_{c}" for c in objects["box_colors"]]
                 box_instruction = "find one of the colored boxes"
 
@@ -1986,9 +2093,14 @@ def main():
                 max_steps=args.max_search_steps, target_kind="colored box",
             )
             if not box_found:
-                print(f"\nCould not visually locate the requested box within "
-                      f"{args.max_search_steps} steps. Skipping placement — "
-                      f"'{target_name}' remains held.")
+                if box_color_not_in_scene:
+                    print(f"\nNo {box_color} box found. A full visual sweep confirmed no box of "
+                          f"that color exists in this scene (only {sorted(objects['box_colors'])}). "
+                          f"Skipping placement — '{target_name}' remains held.")
+                else:
+                    print(f"\nCould not visually locate the requested box within "
+                          f"{args.max_search_steps} steps. Skipping placement — "
+                          f"'{target_name}' remains held.")
                 place_mode = "none"  # skip the placement block below
             else:
                 target_box_id = objects[box_label]
