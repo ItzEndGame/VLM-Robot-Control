@@ -42,6 +42,8 @@ Design notes:
 import argparse
 import json
 import os
+import random
+import time
 
 try:
     from dotenv import load_dotenv
@@ -54,15 +56,105 @@ SEARCH_ACTIONS = ["turn_left", "turn_right", "move_forward", "move_backward", "t
 
 
 class PerceptionError(Exception):
-    """Raised when Gemini perception fails or gives an unusable answer."""
+    """Raised when Gemini perception fails or gives an unusable answer.
+    This is the base/transient case — see PerceptionFatalError below for
+    the subset that's pointless to retry."""
 
 
-def decide_next_action(image_path, instruction, known_objects, api_key=None, model="gemini-3.6-flash"):
+class PerceptionFatalError(PerceptionError):
+    """
+    A PerceptionError that will fail EXACTLY the same way on every call,
+    no matter how many times it's retried or from what robot pose —
+    missing API key, missing package, a bad image path. Retrying these
+    (whether by turning, waiting, or anything else) just burns through
+    the search step budget for no benefit; the caller should stop and
+    report the real problem immediately instead of eventually reporting
+    a misleading "target not found".
+    """
+
+
+def _generate_content_with_retry(client, model, contents, config, max_retries=5, base_delay=2.0):
+    """
+    Call client.models.generate_content, retrying with exponential backoff
+    + jitter specifically on 429 (rate limit) errors — the free tier's RPM
+    cap is easy to hit in a tight search loop with no built-in pacing
+    (verified against a real 429 response: gemini-3.6-flash's free tier
+    is 5 requests/minute, tighter than it might look at a glance, and
+    this script fires one request per search step with no delay between
+    them — a robot that has to turn several times before the target
+    comes into view can burn through that in under a minute).
+
+    Any OTHER error (bad key, network failure, etc.) is NOT retried — it's
+    re-raised immediately, since retrying those just wastes time before
+    failing the same way anyway. Only 429/RESOURCE_EXHAUSTED gets the
+    backoff treatment.
+
+    The 429 response body usually includes the server's own suggested
+    wait time (a RetryInfo.retryDelay, e.g. "28s") — that's a better
+    signal than a blind exponential guess, since it reflects the actual
+    remaining time left in the quota window rather than an arbitrary
+    schedule. Use it when present; fall back to exponential backoff
+    otherwise.
+    """
+    from google.genai import errors as genai_errors
+
+    def _server_retry_delay(e):
+        """Pull RetryInfo.retryDelay (e.g. '28s') out of a 429's details, if present."""
+        try:
+            for detail in (getattr(e, "details", None) or {}).get("error", {}).get("details", []):
+                if detail.get("@type", "").endswith("RetryInfo"):
+                    return float(str(detail["retryDelay"]).rstrip("s"))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+        return None
+
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except genai_errors.APIError as e:
+            is_rate_limit = getattr(e, "code", None) == 429 or getattr(e, "status", None) == "RESOURCE_EXHAUSTED"
+            if not is_rate_limit:
+                raise  # a different API error — don't retry, let the caller handle it
+            last_error = e
+            if attempt == max_retries:
+                break
+            server_delay = _server_retry_delay(e)
+            delay = server_delay + random.uniform(0, 1.0) if server_delay is not None \
+                else base_delay * (2 ** attempt) + random.uniform(0, 1.0)
+            source = "server-suggested" if server_delay is not None else "exponential backoff"
+            print(f"  [gemini] rate limited (429), retrying in {delay:.1f}s "
+                  f"({source}, attempt {attempt + 1}/{max_retries})...")
+            time.sleep(delay)
+
+    raise PerceptionError(
+        f"Gemini API rate limit (429) persisted after {max_retries} retries. "
+        f"Last error: {last_error}. If this keeps happening, your free-tier RPM cap is "
+        f"likely too low for the current --max-search-steps — try reducing it, or wait "
+        f"a minute for the rate limit window to reset."
+    )
+
+
+def decide_next_action(image_path, instruction, known_objects, api_key=None, model="gemini-3.6-flash",
+                        target_kind="object to pick up"):
     """
     One step of a closed-loop visual search: given the robot's CURRENT
     camera view + instruction, decide the single next discrete action —
     instead of the robot driving to one hardcoded point and hoping the
     target happens to be in frame there.
+
+    target_kind describes what `known_objects` actually are, since this
+    same function is reused for two different searches:
+      - target_kind="object to pick up" (default): known_objects is a
+        list of pickable items (e.g. ball colors). The prompt explicitly
+        tells the model to ignore any destination mentioned in the
+        instruction (e.g. "...and place it in the orange box") —
+        otherwise it can latch onto the destination instead of the
+        object actually being searched for in THIS phase.
+      - target_kind="colored box": known_objects is a list of box labels
+        (e.g. "box_orange"). Here the box genuinely IS the target, so the
+        "ignore any box mentioned" guidance would be actively wrong —
+        this phase needs the opposite framing.
 
     Returns a dict: {"action": one of SEARCH_ACTIONS, "target_object": str|None,
                       "visible": bool, "reasoning": str}
@@ -76,15 +168,15 @@ def decide_next_action(image_path, instruction, known_objects, api_key=None, mod
         from google import genai
         from google.genai import types
     except ImportError as e:
-        raise PerceptionError("google-genai is not installed. Run: pip install google-genai") from e
+        raise PerceptionFatalError("google-genai is not installed. Run: pip install google-genai") from e
     try:
         from PIL import Image
     except ImportError as e:
-        raise PerceptionError("Pillow is not installed. Run: pip install pillow") from e
+        raise PerceptionFatalError("Pillow is not installed. Run: pip install pillow") from e
 
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise PerceptionError(
+        raise PerceptionFatalError(
             "No Gemini API key found. Set the GEMINI_API_KEY environment "
             "variable or pass api_key=... explicitly."
         )
@@ -95,13 +187,29 @@ def decide_next_action(image_path, instruction, known_objects, api_key=None, mod
     except Exception as e:
         raise PerceptionError(f"Could not open image '{image_path}': {e}") from e
 
+    if target_kind == "colored box":
+        target_framing = f"""Known {target_kind} candidates that might be visible in the scene: {known_objects}
+
+Each box is painted a distinct solid color matching its label (e.g. the
+box labeled "box_orange" is solid orange) — identify it by that color,
+the same way you'd identify a colored ball."""
+    else:
+        target_framing = f"""Known {target_kind} candidates that might be somewhere in the scene: {known_objects}
+
+The instruction may also mention a DESTINATION (e.g. "...and place it in
+the orange box", "...at the other end of the table") — ignore that part
+entirely for this decision. Your only job here is finding and confirming
+the {target_kind}; a separate step handles placing it afterward. Only ever
+set target_object to one of the known candidates above, never to a
+destination."""
+
     prompt = f"""You are the navigation brain of a mobile robot searching for
 an object. Its front camera just captured the attached image. Its
 instruction is:
 
     "{instruction}"
 
-Known pickable objects that might be somewhere in the scene: {known_objects}
+{target_framing}
 
 Decide the SINGLE best next action for the robot, from exactly this set:
 {SEARCH_ACTIONS}
@@ -124,11 +232,12 @@ Respond with ONLY a JSON object of exactly this shape:
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=[prompt, image],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        response = _generate_content_with_retry(
+            client, model, [prompt, image],
+            types.GenerateContentConfig(response_mime_type="application/json"),
         )
+    except PerceptionError:
+        raise
     except Exception as e:
         raise PerceptionError(f"Gemini API call failed: {type(e).__name__}: {e}") from e
 
@@ -163,18 +272,18 @@ def query_target_object(image_path, instruction, known_objects, api_key=None, mo
         from google import genai
         from google.genai import types
     except ImportError as e:
-        raise PerceptionError(
+        raise PerceptionFatalError(
             "google-genai is not installed. Run: pip install google-genai"
         ) from e
 
     try:
         from PIL import Image
     except ImportError as e:
-        raise PerceptionError("Pillow is not installed. Run: pip install pillow") from e
+        raise PerceptionFatalError("Pillow is not installed. Run: pip install pillow") from e
 
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise PerceptionError(
+        raise PerceptionFatalError(
             "No Gemini API key found. Set the GEMINI_API_KEY environment "
             "variable or pass api_key=... explicitly."
         )
@@ -207,11 +316,12 @@ Respond with ONLY a JSON object of exactly this shape:
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model,
-            contents=[prompt, image],
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        response = _generate_content_with_retry(
+            client, model, [prompt, image],
+            types.GenerateContentConfig(response_mime_type="application/json"),
         )
+    except PerceptionError:
+        raise
     except Exception as e:
         raise PerceptionError(f"Gemini API call failed: {type(e).__name__}: {e}") from e
 

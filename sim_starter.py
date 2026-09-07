@@ -7,7 +7,9 @@ similar service robots: a black two-wheel base, a thin rising column,
 a white humanoid torso with twin arms, and a dark sensor head on top.
 
 Install (on your own machine, with a display):
-    pip install pybullet numpy pillow
+    pip install pybullet numpy google-genai pillow
+    (google-genai and pillow are only needed for the Gemini-driven search;
+    --no-perception skips both.)
 
 Run:
     python sim_mobile_manipulator.py
@@ -57,8 +59,8 @@ Design notes (scoping decisions, worth mentioning in your report):
   fling anything in its path. This was observed directly: an earlier
   version of this script flung a ball meters away on pickup.
 - Run with --no-perception to skip Gemini (and the search loop) entirely
-  and default to a fixed approach point + the green ball, for offline
-  testing without an API key.
+  and default to a fixed approach point + the first known ball, for
+  offline testing without an API key.
 """
 
 import argparse
@@ -139,6 +141,17 @@ _forearm_dir = np.array([np.sin(DECO_FOREARM_PITCH), 0.0, -np.cos(DECO_FOREARM_P
 _deco_forearm_local = tuple(_elbow_local + _forearm_dir * (DECO_FOREARM_LEN / 2))
 _deco_hand_local = tuple(_elbow_local + _forearm_dir * DECO_FOREARM_LEN)
 
+# Worst-case horizontal distance from the robot's (x, y) reference point to
+# ANY physical part of the robot — used by obstacle avoidance so a wheel or
+# the decorative arm can't clip an obstacle even while the reference point
+# itself stays clear of it (that was the actual bug: routing only kept the
+# single reference point outside the keepout zone, not the robot's real
+# footprint). Checked both candidates directly rather than guessing which
+# extends farther — they turned out to be within 1cm of each other.
+_wheel_extent = float(np.hypot(WHEEL_RADIUS, WHEEL_Y_OFFSET + WHEEL_THICKNESS / 2))
+_deco_hand_extent = float(np.hypot(_deco_hand_local[0], _deco_hand_local[1]) + DECO_HAND_RADIUS)
+ROBOT_FOOTPRINT_RADIUS = max(_wheel_extent, _deco_hand_extent)
+
 # Local (robot-frame) offsets for every part, keyed by name. All poses are
 # computed from these + the robot's current (x, y, yaw) every frame.
 LOCAL_OFFSETS = {
@@ -175,8 +188,22 @@ def local_to_world(position_xy, yaw, local_offset):
     return [wx, wy, dz]
 
 
-def setup_static_scene():
-    """Ground plane and table with objects to pick."""
+def setup_static_scene(num_balls=5, num_boxes=5, include_boxes=False):
+    """
+    Ground plane and table with `num_balls` colored balls near the table's
+    front edge. Optionally also `num_boxes` small open-top boxes along the
+    table's FAR end, each painted a distinct solid color — the same visual-
+    identification mechanism already used (and verified reliable) for the
+    balls. Which physical box slot gets which color is shuffled at scene-
+    build time, specifically so nothing downstream (the search/approach
+    code) can assume "the orange box is always at position X" — the only
+    way to find a specific colored box is to actually look at it via the
+    camera, same as finding a specific colored ball.
+
+    (An earlier version painted a NUMBER onto each box via a texture —
+    dropped after a real run showed the numbers weren't actually rendering
+    visibly. Solid color reuses a mechanism already proven to work here.)
+    """
     p.connect(p.GUI)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.8)
@@ -195,32 +222,118 @@ def setup_static_scene():
     near_edge_x = aabb_min[0]  # edge nearest the origin, since table sits at +x
     ball_radius = 0.03
     ball_x = near_edge_x + 0.15   # inset just enough to sit stably on the tabletop
-    ball_z = table_top_z + ball_radius + 0.01
 
-    green_ball_id = p.createMultiBody(
-        baseMass=0.05,
-        baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=ball_radius),
-        baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=ball_radius, rgbaColor=[0, 1, 0, 1]),
-        basePosition=[ball_x, 0.1, ball_z],
-    )
-    red_ball_id = p.createMultiBody(
-        baseMass=0.05,
-        baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=ball_radius),
-        baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=ball_radius, rgbaColor=[1, 0, 0, 1]),
-        basePosition=[ball_x, -0.15, ball_z],
-    )
+    ball_colors = [
+        ("red_ball", [1, 0, 0, 1]),
+        ("green_ball", [0, 1, 0, 1]),
+        ("blue_ball", [0.1, 0.3, 1, 1]),
+        ("yellow_ball", [1, 0.9, 0, 1]),
+        ("purple_ball", [0.6, 0.1, 0.8, 1]),
+    ][:num_balls]
 
-    # PyBullet's default dynamics for a small, light sphere are underdamped
-    # and bouncy — fine for it just sitting on the table, but a real
-    # problem the moment a gripper actually contacts it: verified directly
-    # that this contributes to the fingers "exploding" the ball away on
-    # contact instead of grasping it cleanly.
-    for ball_id in (green_ball_id, red_ball_id):
+    table_half_y = (aabb_max[1] - aabb_min[1]) / 2 - 0.08  # keep off the very edges
+    ball_ys = np.linspace(-table_half_y, table_half_y, len(ball_colors)) if len(ball_colors) > 1 else [0.0]
+
+    objects = {"table": table_id}
+    for (name, rgba), y in zip(ball_colors, ball_ys):
+        ball_z = table_top_z + ball_radius + 0.01
+        ball_id = p.createMultiBody(
+            baseMass=0.05,
+            baseCollisionShapeIndex=p.createCollisionShape(p.GEOM_SPHERE, radius=ball_radius),
+            baseVisualShapeIndex=p.createVisualShape(p.GEOM_SPHERE, radius=ball_radius, rgbaColor=rgba),
+            basePosition=[ball_x, float(y), ball_z],
+        )
+        # PyBullet's default dynamics for a small, light sphere are
+        # underdamped and bouncy — fine for it just sitting on the table,
+        # but a real problem the moment a gripper actually contacts it:
+        # verified directly that this contributes to the fingers
+        # "exploding" the ball away on contact instead of grasping it
+        # cleanly.
         p.changeDynamics(ball_id, -1, lateralFriction=1.2, spinningFriction=0.005,
                           rollingFriction=0.005, restitution=0.0,
                           linearDamping=0.3, angularDamping=0.3)
+        objects[name] = ball_id
+    objects["ball_names"] = [name for name, _ in ball_colors]
 
-    return {"table": table_id, "green_ball": green_ball_id, "red_ball": red_ball_id}
+    if include_boxes:
+        # Simple open-top boxes built from 5 static (mass=0) box primitives
+        # (floor + 4 walls) as ONE compound body each — no external URDF
+        # asset dependency, consistent with how the balls/robot are built.
+        # Sit on the tabletop at the FAR end (opposite the balls), spread
+        # across y so align_for_place's far-edge approach can reach any of
+        # them, and so there's room to visually tell them apart.
+        wall_h, wall_t = 0.06, 0.006
+        inner_half = 0.055  # tight row of 5 across the table's width
+        outer_half = inner_half + wall_t
+        box_x = aabb_max[0] - (outer_half + 0.05)
+        box_ys = np.linspace(-table_half_y, table_half_y, num_boxes) if num_boxes > 1 else [0.0]
+        box_base_z = table_top_z
+
+        # Boxes are identified by SOLID COLOR, not a painted-on number —
+        # texture-mapped digits (tried first) turned out not to render
+        # visibly in practice (verified directly against a real run), and
+        # solid rgbaColor is the one visual-identification mechanism
+        # already proven reliable in this file (it's exactly how the
+        # balls are told apart, and that search has worked consistently).
+        # Reusing a known-good mechanism beats debugging pybullet texture/
+        # UV behavior blind, with no display available to verify fixes.
+        box_color_choices = [
+            ("orange", [1.0, 0.55, 0.0, 1]),
+            ("cyan", [0.0, 0.9, 0.9, 1]),
+            ("magenta", [0.9, 0.1, 0.9, 1]),
+            ("white", [0.95, 0.95, 0.95, 1]),
+            ("black", [0.08, 0.08, 0.08, 1]),
+        ][:num_boxes]
+        random.shuffle(box_color_choices)  # physical left-to-right order is NOT this list's order
+
+        for slot_y, (color_name, box_rgba) in zip(box_ys, box_color_choices):
+            col_shapes = [
+                p.createCollisionShape(p.GEOM_BOX, halfExtents=[outer_half, outer_half, wall_t / 2]),
+                p.createCollisionShape(p.GEOM_BOX, halfExtents=[wall_t / 2, outer_half, wall_h / 2]),
+                p.createCollisionShape(p.GEOM_BOX, halfExtents=[wall_t / 2, outer_half, wall_h / 2]),
+                p.createCollisionShape(p.GEOM_BOX, halfExtents=[outer_half, wall_t / 2, wall_h / 2]),
+                p.createCollisionShape(p.GEOM_BOX, halfExtents=[outer_half, wall_t / 2, wall_h / 2]),
+            ]
+            vis_shapes = [
+                p.createVisualShape(p.GEOM_BOX, halfExtents=[outer_half, outer_half, wall_t / 2], rgbaColor=box_rgba),
+                p.createVisualShape(p.GEOM_BOX, halfExtents=[wall_t / 2, outer_half, wall_h / 2], rgbaColor=box_rgba),
+                p.createVisualShape(p.GEOM_BOX, halfExtents=[wall_t / 2, outer_half, wall_h / 2], rgbaColor=box_rgba),
+                p.createVisualShape(p.GEOM_BOX, halfExtents=[outer_half, wall_t / 2, wall_h / 2], rgbaColor=box_rgba),
+                p.createVisualShape(p.GEOM_BOX, halfExtents=[outer_half, wall_t / 2, wall_h / 2], rgbaColor=box_rgba),
+            ]
+            # Local offsets relative to the box's base frame (base = floor center):
+            local_pos = [
+                [0, 0, wall_t / 2],                                   # floor
+                [-outer_half + wall_t / 2, 0, wall_t + wall_h / 2],   # -x wall
+                [outer_half - wall_t / 2, 0, wall_t + wall_h / 2],    # +x wall (faces an approach from +x)
+                [0, -outer_half + wall_t / 2, wall_t + wall_h / 2],   # -y wall
+                [0, outer_half - wall_t / 2, wall_t + wall_h / 2],    # +y wall
+            ]
+            box_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=col_shapes[0],
+                baseVisualShapeIndex=vis_shapes[0],
+                basePosition=[box_x, float(slot_y), box_base_z],
+                linkMasses=[0] * 4,
+                linkCollisionShapeIndices=col_shapes[1:],
+                linkVisualShapeIndices=vis_shapes[1:],
+                linkPositions=local_pos[1:],
+                linkOrientations=[[0, 0, 0, 1]] * 4,
+                linkInertialFramePositions=[[0, 0, 0]] * 4,
+                linkInertialFrameOrientations=[[0, 0, 0, 1]] * 4,
+                linkParentIndices=[0] * 4,
+                linkJointTypes=[p.JOINT_FIXED] * 4,
+                linkJointAxis=[[0, 0, 0]] * 4,
+            )
+            p.resetBasePositionAndOrientation(box_id, [box_x, float(slot_y), box_base_z], [0, 0, 0, 1])
+
+            objects[f"box_{color_name}"] = box_id
+            # box's floor top surface, in world z — used by align_for_place/
+            # do_place to know how deep to lower the ball.
+            objects[f"box_{color_name}_floor_z"] = box_base_z + wall_t
+        objects["box_colors"] = [name for name, _ in box_color_choices]
+
+    return objects
 
 
 def _make_body(collision_id, visual_id, world_pos, world_orn):
@@ -425,7 +538,7 @@ def move_robot_towards(robot_ids, arm_id, current_pos, target_xy, speed=0.015):
     return new_pos, new_yaw, False
 
 
-def capture_face_camera(position_xy, yaw, save_path=None, live_window=False):
+def capture_face_camera(position_xy, yaw, save_path=None):
     """
     Simulate the 'face' camera: mounted in the HEAD unit, at the front of
     the robot, looking in the direction the robot currently faces.
@@ -436,9 +549,6 @@ def capture_face_camera(position_xy, yaw, save_path=None, live_window=False):
       is called.
     - Pass save_path to also write a PNG snapshot to disk (e.g. once,
       right before sending it to the VLM/Gemini step).
-    - Pass live_window=True to additionally pop up a proper OpenCV
-      window showing the feed, closer to what a real robot camera
-      stream looks like (needs `pip install opencv-python`).
     """
     head_pos = np.array(local_to_world(position_xy, yaw, LOCAL_OFFSETS["head"]))
     forward = np.array([np.cos(yaw), np.sin(yaw), 0])
@@ -461,24 +571,6 @@ def capture_face_camera(position_xy, yaw, save_path=None, live_window=False):
         width, height, view_matrix, proj_matrix, renderer=p.ER_BULLET_HARDWARE_OPENGL
     )
     rgb_array = np.reshape(rgb_img, (height, width, 4))[:, :, :3]
-
-    if live_window:
-        try:
-            import cv2
-            bgr = cv2.cvtColor(rgb_array.astype(np.uint8), cv2.COLOR_RGB2BGR)
-            cv2.imshow("Robot Face Camera (live)", bgr)
-            cv2.waitKey(1)
-        except ImportError:
-            print("opencv-python not installed (pip install opencv-python) — "
-                  "skipping live_window, relying on PyBullet's built-in preview instead.")
-        except Exception as e:
-            # IMPORTANT: this used to only catch ImportError, so any other
-            # OpenCV/display failure (missing Qt plugin, no display backend,
-            # etc.) would crash the whole function BEFORE the save step
-            # below ever ran — that was very likely why no image got saved.
-            print(f"live_window display failed ({type(e).__name__}: {e}) — "
-                  f"continuing without the OpenCV window.")
-
     if save_path:
         try:
             from PIL import Image
@@ -750,6 +842,161 @@ def do_pick(arm_id, target_pos, target_body_id=None):
     return grasp_constraint, pick_succeeded
 
 
+def do_place(arm_id, place_pos, grasp_constraint):
+    """
+    Mirror of do_pick's staged, verified motion pattern, but for RELEASING
+    a held object instead of grasping one: hover above place_pos, reorient
+    if needed, descend, open the gripper (dropping/releasing the object
+    from a small height rather than jamming it into the surface), remove
+    the grasp constraint, then retract.
+
+    Reuses the same lessons do_pick already verified — small joint-space
+    steps for the big far-away move, position+orientation IK locked
+    together only for the final Cartesian approach, gradual (not instant)
+    gripper motion — since there's no reason placing would be less prone
+    to the same jerky-motion issues picking was.
+    """
+    end_effector_index = 11
+    finger_joints = [9, 10]
+    grasp_orientation = p.getQuaternionFromEuler([np.pi, 0, 0])
+
+    # Release from a small height above the target rather than driving the
+    # gripper all the way down to touch it — avoids the fingers (still
+    # holding the object) colliding with the surface itself.
+    release_pos = np.array([place_pos[0], place_pos[1], place_pos[2] + 0.03])
+    hover_pos = np.array([place_pos[0], place_pos[1], place_pos[2] + 0.35])
+
+    controllable = get_controllable_joints(arm_id)
+    start_joint_state = [p.getJointState(arm_id, j)[0] for j in controllable]
+    # Position-ONLY IK for this far-away hover solve — matching do_pick's
+    # own Phase 1 exactly. An earlier version of this function locked
+    # `grasp_orientation` in here too, which is precisely the case do_pick's
+    # docstring already warns is unstable ("Locking it from the very first
+    # far-away hover point was tested and found unstable") — and the
+    # symptom matched exactly: IK offsets of 0.35-0.5m that barely changed
+    # across every subsequent stage, i.e. the solver never found a good
+    # solution at all once orientation was locked this far from the target.
+    hover_joint_solution = p.calculateInverseKinematics(
+        arm_id, end_effector_index, hover_pos.tolist(),
+        maxNumIterations=200, residualThreshold=1e-5,
+    )
+    n_joint_steps = 20
+    for step in range(1, n_joint_steps + 1):
+        t = step / n_joint_steps
+        for i, j in enumerate(controllable):
+            if j in finger_joints:
+                p.setJointMotorControl2(arm_id, j, p.POSITION_CONTROL, 0.0, force=50)  # stay closed
+            else:
+                interp = start_joint_state[i] + (hover_joint_solution[i] - start_joint_state[i]) * t
+                p.setJointMotorControl2(arm_id, j, p.POSITION_CONTROL, interp, force=80)
+        for _ in range(15):
+            p.stepSimulation()
+            time.sleep(1 / 240)
+    actual_hover_pos = p.getLinkState(arm_id, end_effector_index)[0]
+    print(f"  [do_place] stage=hover(joint-space)  target={tuple(round(v,3) for v in hover_pos)}  "
+          f"actual_hand_pos={tuple(round(v,3) for v in actual_hover_pos)}  "
+          f"offset={np.linalg.norm(np.array(actual_hover_pos)-hover_pos):.3f} m")
+
+    # Reorient in place (position held fixed at hover) from whatever
+    # orientation the position-only hover solve naturally landed on, to
+    # the target top-down release orientation — mirrors do_pick's Phase 2
+    # exactly, for the same reason: combining a position change and an
+    # orientation change in one discontinuous IK jump is the specific
+    # thing that produced the original 0.3-0.5m offset bug here (see the
+    # note on the hover solve above). Skipping this step would just move
+    # that same risk one step later, onto the first descent waypoint,
+    # instead of actually eliminating it.
+    hover_orn = p.getLinkState(arm_id, end_effector_index)[1]
+    n_reorient_steps = 12
+    for step in range(1, n_reorient_steps + 1):
+        t = step / n_reorient_steps
+        step_orn = p.getQuaternionSlerp(hover_orn, grasp_orientation, t)
+        joint_poses = p.calculateInverseKinematics(
+            arm_id, end_effector_index, hover_pos.tolist(), step_orn,
+            maxNumIterations=200, residualThreshold=1e-5,
+        )
+        for i, joint_angle in zip(controllable, joint_poses):
+            if i in finger_joints:
+                p.setJointMotorControl2(arm_id, i, p.POSITION_CONTROL, 0.0, force=50)  # stay closed
+            else:
+                p.setJointMotorControl2(arm_id, i, p.POSITION_CONTROL, joint_angle, force=80)
+        for _ in range(20):
+            p.stepSimulation()
+            time.sleep(1 / 240)
+    actual_reoriented_pos = p.getLinkState(arm_id, end_effector_index)[0]
+    print(f"  [do_place] stage=reorient(in-place)  hand now at "
+          f"{tuple(round(v,3) for v in actual_reoriented_pos)}  "
+          f"offset_from_hover={np.linalg.norm(np.array(actual_reoriented_pos)-hover_pos):.4f} m")
+
+    # Fine Cartesian descent from hover down to the release point, orientation
+    # locked for every step (same pattern as do_pick's Phase 3).
+    n_descent_steps = 6
+    waypoints = [
+        hover_pos + (release_pos - hover_pos) * (i / n_descent_steps)
+        for i in range(1, n_descent_steps + 1)
+    ]
+    for idx, pos in enumerate(waypoints):
+        pos = pos.tolist()
+        is_final = idx == len(waypoints) - 1
+        joint_poses = p.calculateInverseKinematics(
+            arm_id, end_effector_index, pos, grasp_orientation,
+            maxNumIterations=200, residualThreshold=1e-5,
+        )
+        for i, joint_angle in zip(controllable, joint_poses):
+            if i in finger_joints:
+                p.setJointMotorControl2(arm_id, i, p.POSITION_CONTROL, 0.0, force=50)  # stay closed until release
+            else:
+                p.setJointMotorControl2(arm_id, i, p.POSITION_CONTROL, joint_angle,
+                                         force=200 if is_final else 80)
+        for _ in range(60):
+            p.stepSimulation()
+            time.sleep(1 / 240)
+        actual_pos = p.getLinkState(arm_id, end_effector_index)[0]
+        offset = np.linalg.norm(np.array(actual_pos) - np.array(pos))
+        stage_name = "release-descent" if is_final else f"descent {idx}/{n_descent_steps}"
+        print(f"  [do_place] stage={stage_name:<16} target={tuple(round(v,3) for v in pos)}  "
+              f"actual_hand_pos={tuple(round(v,3) for v in actual_pos)}  offset={offset:.3f} m")
+
+    # Release: remove the rigid grasp constraint, THEN open the fingers
+    # gradually. Removing the constraint first lets the object fall free
+    # under real physics; opening the fingers gradually (not instantly)
+    # avoids a hard "flick" off a finger that's still in contact.
+    if grasp_constraint is not None:
+        p.removeConstraint(grasp_constraint)
+    n_open_steps = 20
+    for step in range(n_open_steps):
+        finger_target = 0.04 * (step / (n_open_steps - 1))
+        for finger in finger_joints:
+            p.setJointMotorControl2(arm_id, finger, p.POSITION_CONTROL, finger_target, force=10)
+        p.stepSimulation()
+        time.sleep(1 / 240)
+    for _ in range(60):
+        p.stepSimulation()
+        time.sleep(1 / 240)
+
+    # Retract straight up, fingers open, small steps for the same reason
+    # as everywhere else in this file — avoid sweeping through what was
+    # just placed.
+    retract_pos = np.array([place_pos[0], place_pos[1], place_pos[2] + 0.25])
+    n_retract_steps = 4
+    for i in range(1, n_retract_steps + 1):
+        wp = (release_pos + (retract_pos - release_pos) * (i / n_retract_steps)).tolist()
+        joint_poses = p.calculateInverseKinematics(
+            arm_id, end_effector_index, wp, grasp_orientation,
+            maxNumIterations=200, residualThreshold=1e-5,
+        )
+        for j, joint_angle in zip(controllable, joint_poses):
+            if j in finger_joints:
+                p.setJointMotorControl2(arm_id, j, p.POSITION_CONTROL, 0.04, force=20)
+            else:
+                p.setJointMotorControl2(arm_id, j, p.POSITION_CONTROL, joint_angle, force=150)
+        for _ in range(60):
+            p.stepSimulation()
+            time.sleep(1 / 240)
+
+    print("  [do_place] release + retract complete")
+
+
 def run_camera_sanity_check(robot_ids, arm_id, arm_joints, home_targets, robot_pos, yaw,
                              out_dir="camera_check", rotate_steps=8, nudge_dist=0.2):
     """
@@ -784,7 +1031,7 @@ def run_camera_sanity_check(robot_ids, arm_id, arm_joints, home_targets, robot_p
             hold_arm_pose(arm_id, arm_joints, home_targets)
             p.stepSimulation()
             time.sleep(1 / 240)
-        return capture_face_camera(pos, yaw_val, save_path=os.path.join(out_dir, filename), live_window=True)
+        return capture_face_camera(pos, yaw_val, save_path=os.path.join(out_dir, filename))
 
     print(f"\n--- Camera sanity check: saving frames to ./{out_dir}/ ---")
     prev_frame = None
@@ -849,12 +1096,20 @@ def _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, pos, yaw_val)
 # technique for planning around a small number of convex polygonal
 # obstacles.
 
-def get_keepout_rects(objects, clearance=0.15):
+def get_keepout_rects(objects, clearance=ROBOT_FOOTPRINT_RADIUS + 0.05):
     """
     Build (xmin, ymin, xmax, ymax) keepout rectangles for known obstacles,
     expanded by `clearance` so the robot's own body doesn't clip the real
     object even when routed right at the boundary. Currently just the
     table; add more entries here if more obstacles are added to the scene.
+
+    Default clearance = ROBOT_FOOTPRINT_RADIUS (the real worst-case
+    distance from the robot's reference point to any physical part of it —
+    see its definition) plus a small extra margin. The previous default
+    (0.15m) only accounted for a point-robot at the reference (x, y)
+    position; a wheel or the decorative arm could still visibly clip the
+    table's actual geometry even while that reference point stayed
+    outside the old, thinner keepout zone.
     """
     aabb_min, aabb_max = p.getAABB(objects["table"])
     return [(
@@ -896,6 +1151,47 @@ def _point_in_rect(point, rect):
     return xmin <= x <= xmax and ymin <= y <= ymax
 
 
+def _nearest_exit_point(point, rect, margin=0.03):
+    """
+    Given `point` known to be INSIDE `rect`, return the point just outside
+    the nearest edge (straight out, perpendicular to that edge, pushed
+    `margin` past the boundary so it's unambiguously outside).
+
+    Used to fix a real bug: align_for_pick/align_for_place deliberately
+    park the robot CLOSER to the table than the navigation clearance
+    buffer (see PICK_STANDOFF_FROM_EDGE / PLACE_STANDOFF_FROM_EDGE) — the
+    buffer is intentionally more conservative than the real table hitbox,
+    for exactly this reason. That means the next navigate_to call always
+    STARTS inside the keepout rectangle. A straight line from a point
+    inside a convex rectangle to anywhere outside it always crosses the
+    boundary, so plan_path_around_obstacles could never certify ANY
+    corner-routed candidate as fully clear — every one's first leg would
+    be rejected — forcing a fall-through to a completely UNCHECKED direct
+    line. Verified directly: that unchecked fallback is exactly what let
+    the robot drive straight through the table when placing at the far
+    end right after a pick (start = near-edge standoff, goal = far side).
+
+    The fix is this function: take one short, safe hop straight out to
+    the nearest edge of the buffer FIRST (moving further from the table
+    along the same axis the standoff was already built on — this can
+    only move away from the table's real footprint, never into it), then
+    run the normal, fully-checked corner routing from that verified-
+    exterior point.
+    """
+    x, y = point
+    xmin, ymin, xmax, ymax = rect
+    d_left, d_right = x - xmin, xmax - x
+    d_bottom, d_top = y - ymin, ymax - y
+    d_min = min(d_left, d_right, d_bottom, d_top)
+    if d_min == d_left:
+        return (xmin - margin, y)
+    if d_min == d_right:
+        return (xmax + margin, y)
+    if d_min == d_bottom:
+        return (x, ymin - margin)
+    return (x, ymax + margin)
+
+
 def is_path_clear(a_xy, b_xy, keepout_rects):
     return not any(_segment_intersects_rect(a_xy, b_xy, r) for r in keepout_rects)
 
@@ -909,15 +1205,33 @@ def plan_path_around_obstacles(start_xy, goal_xy, keepout_rects):
     corners of the same obstacle, picking the shortest fully-clear
     option found. Falls back to the direct line (with a printed warning)
     only if no clear route through the corners exists at all — this can
-    happen if start or goal is itself inside a keepout region.
+    happen if GOAL is itself inside a keepout region (align_for_pick/
+    align_for_place handle that themselves, by only ever passing this
+    function a goal that's outside every rect, then doing their own
+    verified-safe final creep in — see their docstrings).
+
+    If START is inside a keepout region instead (see _nearest_exit_point's
+    docstring for why that legitimately happens), this first takes a
+    short escape hop to the nearest exterior point, THEN plans normally
+    from there — rather than letting every candidate's first leg fail
+    and silently falling back to a totally unchecked direct line.
     """
     start_xy, goal_xy = tuple(start_xy), tuple(goal_xy)
 
-    if is_path_clear(start_xy, goal_xy, keepout_rects):
-        return [start_xy, goal_xy]
+    escape_hops = []
+    effective_start = start_xy
+    for _ in range(len(keepout_rects) + 1):  # bounded: at most one escape per rect
+        containing = next((r for r in keepout_rects if _point_in_rect(effective_start, r)), None)
+        if containing is None:
+            break
+        effective_start = _nearest_exit_point(effective_start, containing)
+        escape_hops.append(effective_start)
 
     def path_length(path):
         return sum(np.linalg.norm(np.array(path[i + 1]) - np.array(path[i])) for i in range(len(path) - 1))
+
+    if is_path_clear(effective_start, goal_xy, keepout_rects):
+        return [start_xy] + escape_hops + [goal_xy]
 
     # Routing waypoints sit a little OUTSIDE the keepout rectangle's own
     # corners (not exactly on them) — a path between two corners of the
@@ -939,8 +1253,8 @@ def plan_path_around_obstacles(start_xy, goal_xy, keepout_rects):
 
         # Single-corner detour
         for c in corners:
-            path = [start_xy, c, goal_xy]
-            if is_path_clear(start_xy, c, keepout_rects) and is_path_clear(c, goal_xy, keepout_rects):
+            path = [effective_start, c, goal_xy]
+            if is_path_clear(effective_start, c, keepout_rects) and is_path_clear(c, goal_xy, keepout_rects):
                 candidates.append(path)
 
         # Two-corner detour (needed when start/goal are on "opposite sides"
@@ -949,24 +1263,30 @@ def plan_path_around_obstacles(start_xy, goal_xy, keepout_rects):
             for c2 in corners:
                 if c1 == c2:
                     continue
-                path = [start_xy, c1, c2, goal_xy]
+                path = [effective_start, c1, c2, goal_xy]
                 if all(is_path_clear(path[i], path[i + 1], keepout_rects) for i in range(len(path) - 1)):
                     candidates.append(path)
 
     if candidates:
         candidates.sort(key=path_length)
-        return candidates[0]
+        best = candidates[0]
+        return [start_xy] + escape_hops[:-1] + best if escape_hops else [start_xy] + best[1:]
 
     print("  [path planner] no fully clear route found around obstacles "
-          "(start or goal may be inside a keepout zone) — falling back to a direct line.")
-    return [start_xy, goal_xy]
+          "(goal may be inside a keepout zone) — falling back to a direct line.")
+    return [start_xy] + escape_hops + [goal_xy] if escape_hops else [start_xy, goal_xy]
 
 
-def navigate_to(robot_ids, arm_id, arm_joints, home_targets, current_pos, goal_pos, keepout_rects):
+def navigate_to(robot_ids, arm_id, arm_joints, home_targets, current_pos, goal_pos, keepout_rects,
+                 speed=0.015, camera_update_every=5):
     """
     Move the robot from current_pos to goal_pos, routing AROUND any
     obstacle in the way instead of moving through it in a straight line.
-    Returns (final_pos, final_yaw).
+
+    Moves smoothly and gradually (via move_robot_towards) rather than
+    teleporting straight to each waypoint — `speed` is how far it travels
+    per physics step; lower = slower, more visible motion. Returns
+    (final_pos, final_yaw).
     """
     path = plan_path_around_obstacles(current_pos, goal_pos, keepout_rects)
     if len(path) > 2:
@@ -974,57 +1294,181 @@ def navigate_to(robot_ids, arm_id, arm_joints, home_targets, current_pos, goal_p
 
     pos = list(current_pos)
     yaw = 0.0
+    step_count = 0
     for waypoint in path[1:]:
-        direction = np.array(waypoint) - np.array(pos)
-        if np.linalg.norm(direction) > 1e-6:
-            yaw = float(np.arctan2(direction[1], direction[0]))
-        pos = list(waypoint)
-        _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, pos, yaw)
+        reached = False
+        while not reached:
+            pos, new_yaw, reached = move_robot_towards(robot_ids, arm_id, pos, waypoint, speed=speed)
+            if new_yaw is not None:
+                yaw = new_yaw
+            hold_arm_pose(arm_id, arm_joints, home_targets)
+            if step_count % camera_update_every == 0:
+                capture_face_camera(pos, yaw)
+            step_count += 1
+            p.stepSimulation()
+            time.sleep(1 / 240)
+    # Settle once fully arrived, matching the old behavior at the final pose.
+    _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, pos, yaw)
     return pos, yaw
 
 
 def search_for_target(objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, yaw,
-                       instruction, known_objects, api_key, max_steps=10,
-                       turn_step_deg=25, move_step=0.15):
+                       instruction, known_objects, api_key, max_steps=20,
+                       turn_step_deg=25, move_step=0.15, target_kind="object to pick up"):
     """
     Closed-loop VLA-style search: capture the current view, ask Gemini for
     the single next action (turn/move/declare-target-reached), execute it,
     repeat — instead of driving to one hardcoded point and hoping the
     target happens to be in frame there.
 
+    IMPORTANT: this loop's job is only IDENTIFICATION (which known object
+    does the instruction refer to?), not full navigation to a pick-ready
+    pose. It stops as soon as a step reports the target VISIBLE and
+    NAMED — not only on "target_reached" — and hands off to a ground-
+    truth, obstacle-aware path planner (align_for_pick when locating an
+    object to pick up, align_for_place when locating a numbered/colored
+    destination box) for the actual approach. See the inline comment at
+    that check for why: this loop's only movement primitives are turn
+    and move-along-current-heading, which can deadlock (spin in place
+    indefinitely) if the target is only visible while facing an obstacle
+    the robot can't safely walk through — e.g. starting on the far side
+    of the table.
+
     Real obstacle avoidance: any move that would drive the robot through
-    the table's keepout rectangle (see get_keepout_rects) is rejected
-    outright and replaced with a turn, regardless of which side or
-    direction the robot is approaching from — not just a one-directional
-    boundary clamp.
+    the table's real (unpadded) footprint is rejected outright and
+    replaced with a turn, regardless of which side or direction the robot
+    is approaching from — not just a one-directional boundary clamp. This
+    loop checks against the table's raw AABB rather than the padded
+    keepout buffer used elsewhere (see get_keepout_rects) — the padded
+    buffer is intentionally tighter than the robot can approach the table,
+    so a search that starts inside it (e.g. right after a pick) needs to
+    be able to move, not just turn in place.
 
     Returns (robot_pos, yaw, target_name, found_bool).
     """
-    from gemini_perception import decide_next_action, PerceptionError
+    from gemini_perception import decide_next_action, PerceptionError, PerceptionFatalError
 
-    keepout_rects = get_keepout_rects(objects)
+    # Separate, UNBUFFERED rect (clearance=0) used for this loop's own
+    # coarse move-validity check below — NOT the padded rect that
+    # get_keepout_rects returns by default (that one's used by
+    # align_for_pick/align_for_place for the precise final approach).
+    # Reason: the robot can legitimately START a search from INSIDE the
+    # padded buffer (e.g. box search starting right at the pick standoff
+    # position, right after a pick — see PICK_STANDOFF_FROM_EDGE, which is
+    # deliberately closer to the table than the buffer). A segment from a
+    # point inside a rect to anywhere outside it always registers as
+    # "blocked" against that same rect, so using the padded rect here would
+    # make EVERY move_forward/move_backward look blocked in that situation,
+    # deadlocking the robot into turning forever, never able to actually
+    # leave the standoff position. Checking against the real (unpadded)
+    # table hitbox instead is still genuinely collision-safe for this
+    # coarse scanning phase — align_for_pick/align_for_place do the
+    # precise, safety-margin-respecting final approach afterward anyway.
+    real_rects = get_keepout_rects(objects, clearance=0.0)
     x_min_allowed, x_max_allowed = -1.0, 2.5   # generous world bounds, not the obstacle boundary
     y_min_allowed, y_max_allowed = -1.5, 1.5
+
+    # Gemini gets no memory between steps — each call only sees the CURRENT
+    # frame, with no idea which way it turned last time or how far it's
+    # rotated so far. Asking it to freely re-pick turn_left/turn_right every
+    # single step (as long as the target stays invisible) produces a random
+    # walk instead of a clean sweep: 2-3 lefts, a right, more lefts...
+    # (observed directly). That can revisit the same headings repeatedly,
+    # burning far more steps — and API calls — than a real 360-degree scan
+    # needs, and was a direct contributor to hitting the free-tier rate
+    # limit in one run. Fix: once a scan direction is picked (the first
+    # turn while nothing's visible), keep committing to that same
+    # direction until something IS visible — the model still decides
+    # visibility/move/target_reached, it just isn't re-litigating spin
+    # direction on every frame with no memory to base that choice on.
+    scan_direction = None  # +1 = left, -1 = right; set on the first blind turn
+
+    # PerceptionError used to be caught as one bucket and always handled
+    # the same way — turn_left and try again next step — regardless of
+    # WHY it failed. That's wrong for two different reasons depending on
+    # the actual cause:
+    #  - Config errors (missing API key, missing package) fail identically
+    #    on every single call forever; turning does nothing, and the loop
+    #    just burns all max_steps before reporting a misleading "target
+    #    not found" when the real problem is "perception never worked".
+    #  - A transient failure (e.g. a 429 that already exhausted its own
+    #    internal backoff in _generate_content_with_retry) has nothing to
+    #    do with viewpoint — turning moves the robot for no reason related
+    #    to the actual problem, and firing another request immediately
+    #    (right after a call that likely already spent up to ~30-60s
+    #    failing internally) gives it no real cooldown either.
+    # Fix: PerceptionFatalError aborts the search immediately with a clear
+    # message. Plain (transient) PerceptionError holds position — no
+    # turn — and waits before retrying the SAME frame, capped at a few
+    # consecutive failures before giving up early instead of grinding
+    # through the rest of max_steps uselessly.
+    consecutive_perception_failures = 0
+    max_consecutive_perception_failures = 3
+    perception_retry_wait_s = 5.0
 
     print(f"\n--- Visual search: up to {max_steps} steps, instruction = {instruction!r} ---")
     for step in range(max_steps):
         _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, robot_pos, yaw)
         img_path = os.path.abspath(f"search_step_{step:02d}.png")
-        capture_face_camera(robot_pos, yaw, save_path=img_path, live_window=True)
+        capture_face_camera(robot_pos, yaw, save_path=img_path)
 
         try:
-            result = decide_next_action(img_path, instruction, known_objects, api_key=api_key)
+            result = decide_next_action(img_path, instruction, known_objects, api_key=api_key,
+                                         target_kind=target_kind)
+            consecutive_perception_failures = 0
+        except PerceptionFatalError as e:
+            print(f"  step {step}: perception failed permanently ({e}) — this won't fix itself by "
+                  f"turning or retrying. Stopping the search now instead of wasting the remaining "
+                  f"steps.")
+            return robot_pos, yaw, None, False
         except PerceptionError as e:
-            print(f"  step {step}: perception failed ({e}) — turning to try a different view.")
-            result = {"action": "turn_left", "target_object": None, "visible": False,
-                      "reasoning": "perception error, scanning"}
+            consecutive_perception_failures += 1
+            if consecutive_perception_failures >= max_consecutive_perception_failures:
+                print(f"  step {step}: perception failed {consecutive_perception_failures} times in a "
+                      f"row ({e}) — giving up early instead of continuing to burn through max_steps.")
+                return robot_pos, yaw, None, False
+            print(f"  step {step}: perception failed ({e}) — holding position, retrying in "
+                  f"{perception_retry_wait_s:.0f}s (attempt {consecutive_perception_failures}/"
+                  f"{max_consecutive_perception_failures})...")
+            time.sleep(perception_retry_wait_s)
+            continue  # re-capture and retry from the SAME pose, don't move blindly
 
         action = result.get("action")
+
+        # Override the model's turn direction (not its action choice) once
+        # a sweep is already underway — see the scan_direction comment
+        # above. Only applies while still blind; once visible, fall
+        # through to the return below and this never matters.
+        if not result.get("visible") and action in ("turn_left", "turn_right"):
+            if scan_direction is None:
+                scan_direction = 1 if action == "turn_left" else -1
+            forced_action = "turn_left" if scan_direction == 1 else "turn_right"
+            if forced_action != action:
+                print(f"  step {step}: model suggested {action}, holding course "
+                      f"({forced_action}) to keep the sweep going in one direction.")
+            action = forced_action
+
         print(f"  step {step}: action={action:<14} target={result.get('target_object')!s:<10} "
               f"visible={result.get('visible')!s:<5}  ({result.get('reasoning')})")
 
-        if action == "target_reached" and result.get("target_object") in known_objects:
-            print(f"--- Target found after {step + 1} step(s): {result['target_object']} ---\n")
+        # End the search as soon as the target is VISIBLE and IDENTIFIED —
+        # not only on "target_reached". Waiting for Gemini to also judge
+        # "close enough" forces continued turn/move-along-heading actions,
+        # and those can deadlock: if the target is only visible while
+        # facing an obstacle the robot can't safely walk through (e.g.
+        # starting on the far side of the table), every move toward it
+        # gets blocked, so the robot just turns away — loses sight of the
+        # target — turns back — repeat, spinning in place indefinitely
+        # without ever making positional progress (observed directly: 10+
+        # steps of turn_left in a row with the table between robot and
+        # ball). Once identified, hand off to align_for_pick's ground-
+        # truth-based, obstacle-aware path planner instead — it already
+        # computes the correct approach regardless of distance/angle, so
+        # there's no benefit to creeping closer via unreliable vision-
+        # guided steps first.
+        if result.get("visible") and result.get("target_object") in known_objects:
+            print(f"--- Target identified after {step + 1} step(s): {result['target_object']} "
+                  f"(handing off to deterministic approach) ---\n")
             return robot_pos, yaw, result["target_object"], True
 
         if action == "turn_left":
@@ -1041,7 +1485,7 @@ def search_for_target(objects, robot_ids, arm_id, arm_joints, home_targets, robo
             # the table's keepout rectangle? Reject the move outright rather
             # than silently clamping to some nearby "safe-ish" point, which
             # could still graze the obstacle depending on approach angle.
-            if is_path_clear(robot_pos, candidate, keepout_rects):
+            if is_path_clear(robot_pos, candidate, real_rects):
                 robot_pos = candidate
             else:
                 print(f"  step {step}: {action} would drive into the table — blocked, turning instead.")
@@ -1060,7 +1504,8 @@ def search_for_target(objects, robot_ids, arm_id, arm_joints, home_targets, robo
 PICK_STANDOFF_FROM_EDGE = 0.20
 
 
-def align_for_pick(objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, target_pos, table_id):
+def align_for_pick(objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, target_pos, table_id,
+                    approach_speed=0.008):
     """
     Reposition the robot to a validated pose for do_pick, instead of just
     creeping forward until "close enough" by raw distance.
@@ -1097,11 +1542,201 @@ def align_for_pick(objects, robot_ids, arm_id, arm_joints, home_targets, robot_p
     aligned_pos = [target_x, target_y]
 
     keepout_rects = get_keepout_rects(objects)
-    navigate_to(robot_ids, arm_id, arm_joints, home_targets, robot_pos, aligned_pos, keepout_rects)
-    # Face the table squarely once there — navigate_to leaves yaw pointed
-    # along the last travel segment, but do_pick was validated at yaw=0.
+
+    # PICK_STANDOFF_FROM_EDGE (0.20m) is deliberately closer to the table
+    # than the obstacle-avoidance clearance (ROBOT_FOOTPRINT_RADIUS + 0.05,
+    # ~0.45m) — do_pick needs that proximity to reach the object. That
+    # means aligned_pos always sits INSIDE the keepout rectangle, so
+    # plan_path_around_obstacles can never certify a fully-clear route
+    # all the way to it (a line from outside a convex region to a point
+    # inside it always crosses the boundary) and falls back to an
+    # UNCHECKED straight line for the whole remaining trip — which can
+    # cut straight through the table's real geometry if the robot is
+    # coming from the opposite side (this is what was driving the
+    # wheel/decorative-arm-through-the-table bug).
+    #
+    # Fix: route with full protection only as far as the edge of the
+    # clearance buffer (still outside the real table), with y already
+    # aligned to the target. From there, x only decreases from
+    # (table_edge - clearance) to (table_edge - PICK_STANDOFF_FROM_EDGE) —
+    # both less than the table's real aabb_min[0] — so this final creep
+    # can never re-enter the table's actual x-range, regardless of y.
+    outer_margin = 0.05
+    outer_x = aabb_min[0] - (ROBOT_FOOTPRINT_RADIUS + 0.05) - outer_margin
+    outer_pos = [outer_x, target_y]
+
+    robot_pos, yaw = navigate_to(robot_ids, arm_id, arm_joints, home_targets, robot_pos, outer_pos,
+                                  keepout_rects, speed=approach_speed)
+
+    # Final straight creep into the pick pose — safe by construction (see
+    # above), so it's fine that it isn't run through the keepout planner.
+    pos = list(robot_pos)
+    while True:
+        pos, new_yaw, reached = move_robot_towards(robot_ids, arm_id, pos, aligned_pos, speed=approach_speed)
+        if new_yaw is not None:
+            yaw = new_yaw
+        hold_arm_pose(arm_id, arm_joints, home_targets)
+        capture_face_camera(pos, yaw)
+        p.stepSimulation()
+        time.sleep(1 / 240)
+        if reached:
+            break
+
+    # Face the table squarely once there — the creep above leaves yaw
+    # pointed along the final travel segment, but do_pick was validated
+    # at yaw=0.
     _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, aligned_pos, 0.0)
     return aligned_pos, 0.0
+
+
+# Same reasoning as PICK_STANDOFF_FROM_EDGE, mirrored for the far edge —
+# do_place doesn't need the same millimeter-precision approach do_pick
+# does (it's dropping into an open area or a generously-sized box, not
+# threading fingers around a 3cm ball), but staying in the same standoff
+# ballpark keeps the arm's reach well within its validated working range.
+PLACE_STANDOFF_FROM_EDGE = 0.20
+
+
+def align_for_place(objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, place_target_xy,
+                     table_id, approach_speed=0.008):
+    """
+    Mirror of align_for_pick, but for approaching the table's FAR edge
+    (opposite the balls) instead of the near edge — used to walk the
+    robot around to the other side of the table for a place action.
+
+    Same two corrections as align_for_pick: (1) an empirically-reasonable
+    standoff distance from the table edge, (2) y shifted so the arm's
+    shoulder mount lines up with place_target_xy's y. The sign of the y
+    correction flips relative to align_for_pick because the robot faces
+    -x here (yaw=pi) instead of +x (yaw=0) — LOCAL_OFFSETS[ARM_MOUNT_KEY]
+    is defined relative to the robot's own facing direction, so the
+    world-frame shoulder offset rotates with yaw. Same fix as
+    align_for_pick applies for routing: navigate_to only as far as the
+    edge of the full clearance buffer, then a final straight creep whose
+    x never re-enters the table's real x-range (here: decreasing from
+    outer_x down to aligned_x, both > aabb_max[0]) so it can't cut
+    through the table's real geometry regardless of which side the robot
+    starts on.
+    """
+    _, aabb_max = p.getAABB(table_id)
+    place_yaw = np.pi  # facing -x, back toward the table, from beyond the far edge
+    target_x = aabb_max[0] + PLACE_STANDOFF_FROM_EDGE
+    target_y = place_target_xy[1] - LOCAL_OFFSETS[ARM_MOUNT_KEY][1] * np.cos(place_yaw)
+    aligned_pos = [target_x, target_y]
+
+    keepout_rects = get_keepout_rects(objects)
+    outer_margin = 0.05
+    outer_x = aabb_max[0] + (ROBOT_FOOTPRINT_RADIUS + 0.05) + outer_margin
+    outer_pos = [outer_x, target_y]
+
+    robot_pos, yaw = navigate_to(robot_ids, arm_id, arm_joints, home_targets, robot_pos, outer_pos,
+                                  keepout_rects, speed=approach_speed)
+
+    pos = list(robot_pos)
+    while True:
+        pos, new_yaw, reached = move_robot_towards(robot_ids, arm_id, pos, aligned_pos, speed=approach_speed)
+        if new_yaw is not None:
+            yaw = new_yaw
+        hold_arm_pose(arm_id, arm_joints, home_targets)
+        capture_face_camera(pos, yaw)
+        p.stepSimulation()
+        time.sleep(1 / 240)
+        if reached:
+            break
+
+    _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, aligned_pos, place_yaw)
+    return aligned_pos, place_yaw
+
+
+def _idle_until_closed():
+    print("\nSimulation running. Close the window or Ctrl+C to exit.")
+    try:
+        while True:
+            p.stepSimulation()
+            time.sleep(1 / 240)
+    except KeyboardInterrupt:
+        p.disconnect()
+    except p.error:
+        # Closing the PyBullet window disconnects the physics server, so
+        # the next stepSimulation() call throws this — that's the user
+        # doing exactly what the prompt above told them to do, not a bug.
+        pass
+
+
+def infer_ball_target(instruction, ball_names):
+    """
+    Deterministic parse of which SPECIFIC ball the instruction names
+    (e.g. "pick up the yellow ball" -> "yellow_ball"), matched against
+    the actual balls present (`ball_names`, e.g. objects["ball_names"]).
+
+    This exists to fix a real bug: search_for_target's finishing check
+    was `result.get("target_object") in known_objects` — true for ANY
+    known ball, not specifically the one asked for. Passing the FULL
+    ball list as known_objects meant that if Gemini spotted a different
+    colored ball first while scanning and reported it as visible, the
+    search would immediately lock onto and hand off the WRONG ball. The
+    fix is for the caller to narrow known_objects down to just this one
+    specific target when it can be determined, so nothing else can match.
+
+    Returns a name from `ball_names`, or None if no color in the
+    instruction matches any ball actually present (caller should fall
+    back to the full list, degraded but still functional).
+    """
+    text = instruction.lower()
+    for name in ball_names:
+        color = name.split("_")[0]
+        if color in text:
+            return name
+    return None
+
+
+def infer_place_intent(instruction):
+    """
+    Deterministic, no-API-call parse of a place destination out of the
+    instruction text — e.g. "pick up the red ball and place it in the
+    box" or "...and put it at the other end of the table".
+
+    Deliberately keyword-based rather than another Gemini call: this only
+    needs to pick between 3 fixed outcomes, and every extra API call is
+    one more chance to trip the free-tier rate limit (see the earlier
+    429 issue) for something a plain string match handles reliably.
+
+    Returns "box", "other-end", or "none" (no place instruction detected
+    — in which case the run just picks and holds, as before).
+    """
+    text = instruction.lower()
+    box_keywords = ("box", "container", "bin", "crate")
+    other_end_keywords = ("other end", "far end", "opposite end", "opposite side",
+                           "other side", "across the table", "far side")
+    if any(kw in text for kw in box_keywords):
+        return "box"
+    if any(kw in text for kw in other_end_keywords):
+        return "other-end"
+    return "none"
+
+
+# Kept in sync with the color set built in setup_static_scene.
+_BOX_COLOR_NAMES = ["orange", "cyan", "magenta", "white", "black"]
+
+
+def infer_box_color(instruction):
+    """
+    Deterministic parse of which box COLOR the instruction names (e.g.
+    "the orange box", "put it in the cyan box") — same no-extra-API-call
+    reasoning as infer_place_intent. This only decides which SEARCH TARGET
+    to hand to search_for_target (a target string like "box_orange"); it
+    does NOT tell the robot where that box physically is — that's still
+    discovered purely by the robot reading the box's color with its
+    camera, same as it locates a ball by color.
+
+    Returns a color name string, or None if no box color was named
+    (caller should fall back to searching for any box).
+    """
+    text = instruction.lower()
+    for color in _BOX_COLOR_NAMES:
+        if color in text:
+            return color
+    return None
 
 
 def main():
@@ -1120,11 +1755,22 @@ def main():
     )
     parser.add_argument(
         "--no-perception", action="store_true",
-        help="Skip the Gemini call entirely and just target the green ball (offline testing, no API key needed).",
+        help="Skip the Gemini call entirely and just target the first known ball "
+             "(offline testing, no API key needed).",
     )
     parser.add_argument(
-        "--max-search-steps", type=int, default=10,
-        help="Max turn/move steps the visual search loop will take before giving up and falling back.",
+        "--max-search-steps", type=int, default=20,
+        help="Max turn/move steps the visual search loop will take before giving up. "
+             "A full 360-degree scan alone takes ~15 steps at the default 25-degree turn "
+             "step, so this needs to be comfortably above that to also allow movement — "
+             "raise it further for --random-start or large --start-yaw-deg values.",
+    )
+    parser.add_argument(
+        "--approach-speed", type=float, default=0.008,
+        help="How far the robot moves per physics step (in meters) during the final "
+             "approach to the pick position, after the target is identified. Lower = "
+             "slower, more visible driving motion. Default 0.008; try e.g. 0.02 for "
+             "faster/less patient runs, or 0.004 for an even slower demo.",
     )
     parser.add_argument(
         "--print-joints", action="store_true",
@@ -1154,9 +1800,21 @@ def main():
              "Useful for stress-testing the search loop from many different starting conditions, "
              "including ones where the target isn't visible at all until the robot turns.",
     )
+    parser.add_argument(
+        "--place", choices=["auto", "none", "other-end", "box"], default="auto",
+        help="What to do with the object after picking it up. Default 'auto' parses this from "
+             "--instruction itself (e.g. 'pick up the red ball and place it in the box', or "
+             "'...and put it at the other end of the table') — no need to set this explicitly "
+             "in normal use. Set it directly only to override that parse: 'other-end' sets the "
+             "object down on the table's far edge; 'box' drops it into a small open-top box "
+             "placed at the table's far end (added to the scene automatically); 'none' picks "
+             "and holds only, ignoring any destination mentioned in the instruction.",
+    )
     args = parser.parse_args()
 
-    objects = setup_static_scene()
+    place_mode = infer_place_intent(args.instruction) if args.place == "auto" else args.place
+    box_color = infer_box_color(args.instruction) if place_mode == "box" else None
+    objects = setup_static_scene(include_boxes=(place_mode == "box"))
     robot_ids = create_robot_visual()
 
     if args.random_start:
@@ -1215,11 +1873,21 @@ def main():
             p.disconnect()
         return
 
-    known_objects = ["green_ball", "red_ball"]
+    # Narrow the search target to the SPECIFIC ball named in the
+    # instruction when we can tell which one that is (almost always,
+    # since the whole point of the instruction is naming one) — see
+    # infer_ball_target's docstring for why this matters: passing the
+    # full list here would let the search lock onto ANY ball Gemini
+    # happens to spot first, not necessarily the one asked for.
+    requested_ball = infer_ball_target(args.instruction, objects["ball_names"])
+    known_objects = [requested_ball] if requested_ball is not None else objects["ball_names"]
+    if requested_ball is None:
+        print(f"Could not determine which specific ball '{args.instruction!r}' refers to from its "
+              f"color — searching for any of {objects['ball_names']} instead.")
 
     if args.no_perception:
         # Offline fallback path: skip the search loop entirely, drive to a
-        # fixed standoff point and just target the green ball.
+        # fixed standoff point and just target the first ball.
         print("--no-perception set: skipping the visual search loop.")
         approach_xy = compute_approach_point(objects["table"], robot_pos, standoff=0.25)
         aabb_min, aabb_max = p.getAABB(objects["table"])
@@ -1228,8 +1896,8 @@ def main():
         yaw = float(np.arctan2(facing[1], facing[0]))
         robot_pos = approach_xy
         _place_and_settle(robot_ids, arm_id, arm_joints, home_targets, robot_pos, yaw)
-        capture_face_camera(robot_pos, yaw, save_path=os.path.abspath("scene.png"), live_window=True)
-        target_name = "green_ball"
+        capture_face_camera(robot_pos, yaw, save_path=os.path.abspath("scene.png"))
+        target_name = known_objects[0]
     else:
         # --- Closed-loop visual search: the robot decides its own turns/
         # moves based on what it currently sees, instead of driving to one
@@ -1240,8 +1908,20 @@ def main():
             max_steps=args.max_search_steps,
         )
         if not found:
-            target_name = "green_ball"
-            print(f"Falling back to '{target_name}' since search didn't confirm a target.")
+            # IMPORTANT: do NOT silently substitute a different object here.
+            # Grabbing "the green ball" when the person asked for "the red
+            # ball" and reporting it as a completed pick is actively
+            # misleading — there's no indication anywhere that the wrong
+            # object was picked unless you read the console closely. If the
+            # search couldn't confirm the actual target, the honest outcome
+            # is: report that clearly and stop, don't attempt a pick at all.
+            print(f"\nSearch FAILED: could not locate a target matching {args.instruction!r} "
+                  f"within {args.max_search_steps} steps.")
+            print("No pick attempted. If the robot started far from the table, try increasing "
+                  "--max-search-steps, or check that the instruction names a known object "
+                  f"({known_objects}).")
+            _idle_until_closed()
+            return
 
     # The VLM only decided WHICH object and roughly confirmed it's close —
     # ground the final approach in the physics engine's real object pose,
@@ -1251,11 +1931,12 @@ def main():
     target_object_pos = p.getBasePositionAndOrientation(objects[target_name])[0]
     robot_pos, yaw = align_for_pick(
         objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, target_object_pos, objects["table"],
+        approach_speed=args.approach_speed,
     )
     target_object_pos = p.getBasePositionAndOrientation(objects[target_name])[0]  # re-read after moving
 
     print("Executing pick...")
-    _, pick_succeeded = do_pick(arm_id, target_object_pos, target_body_id=objects[target_name])
+    grasp_constraint, pick_succeeded = do_pick(arm_id, target_object_pos, target_body_id=objects[target_name])
 
     final_pos = p.getBasePositionAndOrientation(objects[target_name])[0]
     if pick_succeeded:
@@ -1264,18 +1945,94 @@ def main():
         print(f"Pick FAILED — '{target_name}' was not actually lifted (position now: {final_pos}). "
               f"It may have been knocked off the table or missed during the grasp.")
 
-    print("\nSimulation running. Close the window or Ctrl+C to exit.")
-    try:
-        while True:
-            p.stepSimulation()
-            time.sleep(1 / 240)
-    except KeyboardInterrupt:
-        p.disconnect()
-    except p.error:
-        # Closing the PyBullet window disconnects the physics server, so
-        # the next stepSimulation() call throws this — that's the user
-        # doing exactly what the prompt above told them to do, not a bug.
-        pass
+    if pick_succeeded and place_mode != "none":
+        aabb_min, aabb_max = p.getAABB(objects["table"])
+        table_top_z = aabb_max[2]
+        ball_radius = 0.03  # matches setup_static_scene
+
+        target_box_id = None
+        if place_mode == "box":
+            # Which physical box is "the orange box" is NOT known here —
+            # color is only recorded as the box's own rgbaColor (see
+            # setup_static_scene). Find it the same way the ball was
+            # found: reuse search_for_target's vision loop, just pointed
+            # at box labels instead of ball colors.
+            #
+            # Narrow box_labels to the SPECIFIC requested color (when
+            # named and valid) rather than always listing every color —
+            # same fix, same reasoning as infer_ball_target above: passing
+            # every color as "known" would let the search lock onto
+            # whichever box Gemini happens to see FIRST while scanning
+            # (e.g. cyan, on the way to actually finding orange), not the
+            # one actually requested. This is likely exactly what caused
+            # a real observed failure: the robot located some other box
+            # while scanning past it, and placed there instead.
+            if box_color is not None and box_color in objects["box_colors"]:
+                box_labels = [f"box_{box_color}"]
+                box_instruction = f"find the {box_color} colored box"
+            else:
+                if box_color is not None:
+                    print(f"\nThe '{box_color}' box was requested but only "
+                          f"{sorted(objects['box_colors'])} boxes exist in this scene — "
+                          f"searching for any box instead.")
+                box_labels = [f"box_{c}" for c in objects["box_colors"]]
+                box_instruction = "find one of the colored boxes"
+
+            print(f"\nLocating the{f' {box_color}' if box_color is not None else ''} "
+                  f"box by its color...")
+            robot_pos, yaw, box_label, box_found = search_for_target(
+                objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, yaw,
+                box_instruction, box_labels, args.gemini_api_key,
+                max_steps=args.max_search_steps, target_kind="colored box",
+            )
+            if not box_found:
+                print(f"\nCould not visually locate the requested box within "
+                      f"{args.max_search_steps} steps. Skipping placement — "
+                      f"'{target_name}' remains held.")
+                place_mode = "none"  # skip the placement block below
+            else:
+                target_box_id = objects[box_label]
+                found_color = box_label.split("_", 1)[1]
+                if box_color is not None and found_color != box_color:
+                    print(f"  Note: asked for the {box_color} box, but the robot found "
+                          f"the {found_color} box — placing there anyway (it's what it "
+                          f"actually found and confirmed via camera).")
+                box_color = found_color
+
+        if place_mode == "box" and target_box_id is not None:
+            box_aabb_min, box_aabb_max = p.getAABB(target_box_id)
+            place_xy = [(box_aabb_min[0] + box_aabb_max[0]) / 2, (box_aabb_min[1] + box_aabb_max[1]) / 2]
+            place_z = objects[f"box_{box_color}_floor_z"] + ball_radius + 0.01
+            place_desc = f"into the {box_color} box"
+        elif place_mode == "other-end":
+            place_xy = [aabb_max[0] - 0.15, 0.0]  # mirrors ball_x inset from setup_static_scene, far edge
+            place_z = table_top_z + ball_radius + 0.01
+            place_desc = "at the table's far end"
+        else:
+            place_xy = place_z = place_desc = None  # placement was skipped above
+
+        if place_xy is not None:
+            print(f"\nPlacing '{target_name}' {place_desc}...")
+            robot_pos, yaw = align_for_place(
+                objects, robot_ids, arm_id, arm_joints, home_targets, robot_pos, place_xy,
+                objects["table"], approach_speed=args.approach_speed,
+            )
+            do_place(arm_id, [place_xy[0], place_xy[1], place_z], grasp_constraint)
+
+            final_pos = p.getBasePositionAndOrientation(objects[target_name])[0]
+            # Distance check, not an exact-position check — the ball rolls/
+            # settles after release, so "landed near the target" (or "landed
+            # inside the box's footprint") is the meaningful success signal.
+            if target_box_id is not None:
+                placed_ok = (box_aabb_min[0] <= final_pos[0] <= box_aabb_max[0]
+                             and box_aabb_min[1] <= final_pos[1] <= box_aabb_max[1]
+                             and final_pos[2] < table_top_z + 0.15)
+            else:
+                placed_ok = np.hypot(final_pos[0] - place_xy[0], final_pos[1] - place_xy[1]) < 0.15
+            verdict = "SUCCESS" if placed_ok else "uncertain — check final position"
+            print(f"Place {verdict}. '{target_name}' final position:", final_pos)
+
+    _idle_until_closed()
 
 
 if __name__ == "__main__":
